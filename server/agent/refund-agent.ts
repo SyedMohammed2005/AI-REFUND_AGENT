@@ -11,6 +11,7 @@ import { findOrder } from "../tools/find-order";
 import { getRefundPolicy } from "../tools/get-refund-policy";
 import { checkRefundEligibility } from "../tools/check-refund-eligibility";
 import { processRefund } from "../tools/process-refund";
+import { createAgentLog } from "../services/agent-logger";
 
 const apiKey = process.env.GEMINI_API_KEY;
 
@@ -22,10 +23,7 @@ const gemini = new GoogleGenAI({
   apiKey,
 });
 
-// const MODEL = "gemini-3.1-flash-lite";
-
-
-const MODEL = "gemini-3-flash-preview";
+const MODEL = "gemini-3.1-flash-lite";
 
 const systemInstruction = `
 You are an e-commerce customer support refund agent.
@@ -172,6 +170,16 @@ type AgentInput = {
   reason: string;
 };
 
+/**
+ * Logging must never block the actual refund agent.
+ * If Neon/Prisma logging fails, the agent continues.
+ */
+function safeLog(input: Parameters<typeof createAgentLog>[0]) {
+  void createAgentLog(input).catch((error) => {
+    console.error("Agent log failed:", error);
+  });
+}
+
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -232,6 +240,19 @@ export async function runRefundAgent({
 
   const executionSteps: AgentStep[] = [];
 
+  let customerId: string | undefined;
+  let orderId: string | undefined;
+
+  safeLog({
+    sessionId,
+    event: "AGENT_STARTED",
+    status: "STARTED",
+    details: {
+      email,
+      orderNumber,
+    },
+  });
+
   const contents: Array<{
     role: "user" | "model";
     parts: Array<Record<string, unknown>>;
@@ -278,11 +299,18 @@ Do not invent any information.
 
     const functionCalls = response.functionCalls ?? [];
 
-    /*
-     * Gemini has finished calling tools.
-     * Return its customer-facing response.
-     */
     if (functionCalls.length === 0) {
+      safeLog({
+        sessionId,
+        customerId,
+        orderId,
+        event: "AGENT_COMPLETED",
+        status: "SUCCESS",
+        details: {
+          message: "Gemini completed the refund request.",
+        },
+      });
+
       return {
         success: true,
         status: "COMPLETED",
@@ -294,10 +322,6 @@ Do not invent any information.
       };
     }
 
-    /*
-     * Add Gemini's function-call message back into
-     * the conversation so Gemini can continue the loop.
-     */
     const modelParts =
       response.candidates?.[0]?.content?.parts ?? [];
 
@@ -308,24 +332,34 @@ Do not invent any information.
 
     const functionResponseParts: Array<Record<string, unknown>> = [];
 
-    /*
-     * Execute every tool selected by Gemini.
-     */
     for (const functionCall of functionCalls) {
       if (!functionCall.name) {
+        const details =
+          "Gemini returned a function call without a function name.";
+
         executionSteps.push({
           tool: "unknown",
           status: "FAILED",
-          details:
-            "Gemini returned a function call without a function name.",
+          details,
+        });
+
+        safeLog({
+          sessionId,
+          customerId,
+          orderId,
+          event: "TOOL_CALL",
+          toolName: "unknown",
+          status: "FAILED",
+          details: {
+            message: details,
+          },
         });
 
         functionResponseParts.push({
           functionResponse: {
             name: "unknown",
             response: {
-              error:
-                "Gemini returned a function call without a function name.",
+              error: details,
             },
           },
         });
@@ -334,6 +368,7 @@ Do not invent any information.
       }
 
       const toolName = functionCall.name;
+
       const args = (functionCall.args ?? {}) as Record<
         string,
         unknown
@@ -345,13 +380,65 @@ Do not invent any information.
         details: "Gemini selected this tool.",
       });
 
+      safeLog({
+        sessionId,
+        customerId,
+        orderId,
+        event: "TOOL_CALL",
+        toolName,
+        status: "STARTED",
+        details: {
+          message: "Gemini selected this tool.",
+        },
+      });
+
       try {
         const result = await executeTool(toolName, args);
+
+        if (
+          toolName === "find_customer" &&
+          typeof result === "object" &&
+          result !== null &&
+          "found" in result &&
+          result.found === true &&
+          "customer" in result &&
+          result.customer &&
+          typeof result.customer === "object" &&
+          "id" in result.customer
+        ) {
+          customerId = String(result.customer.id);
+        }
+
+        if (
+          toolName === "find_order" &&
+          typeof result === "object" &&
+          result !== null &&
+          "found" in result &&
+          result.found === true &&
+          "order" in result &&
+          result.order &&
+          typeof result.order === "object" &&
+          "id" in result.order
+        ) {
+          orderId = String(result.order.id);
+        }
 
         executionSteps.push({
           tool: toolName,
           status: "SUCCESS",
           details: "Tool executed successfully.",
+        });
+
+        safeLog({
+          sessionId,
+          customerId,
+          orderId,
+          event: "TOOL_CALL",
+          toolName,
+          status: "SUCCESS",
+          details: {
+            message: "Tool executed successfully.",
+          },
         });
 
         functionResponseParts.push({
@@ -375,6 +462,18 @@ Do not invent any information.
           details: errorMessage,
         });
 
+        safeLog({
+          sessionId,
+          customerId,
+          orderId,
+          event: "TOOL_CALL",
+          toolName,
+          status: "FAILED",
+          details: {
+            message: errorMessage,
+          },
+        });
+
         functionResponseParts.push({
           functionResponse: {
             name: toolName,
@@ -387,14 +486,23 @@ Do not invent any information.
       }
     }
 
-    /*
-     * Send the real tool results back to Gemini.
-     */
     contents.push({
       role: "user",
       parts: functionResponseParts,
     });
   }
+
+  safeLog({
+    sessionId,
+    customerId,
+    orderId,
+    event: "AGENT_LIMIT",
+    status: "FAILED",
+    details: {
+      message:
+        "The refund agent reached the maximum tool-call limit.",
+    },
+  });
 
   return {
     success: false,
